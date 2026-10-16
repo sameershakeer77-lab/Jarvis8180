@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Free Gemini Live Call</title>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #111; color: #fff; text-align: center; padding: 20px; }
+    video { width: 280px; height: 210px; background: #222; border-radius: 12px; object-fit: cover; margin: 12px 0; }
+    input, button { padding: 12px; border-radius: 8px; border: none; font-size: 15px; margin: 5px; }
+    input { width: 260px; background: #222; color: #fff; border: 1px solid #444; }
+    button { background: #2563eb; color: white; font-weight: bold; cursor: pointer; }
+    button.stop { background: #dc2626; }
+    #status { color: #9ca3af; margin-top: 10px; font-size: 14px; }
+  </style>
+</head>
+<body>
+
+  <h2>Gemini Live (Audio + Video)</h2>
+  <input type="password" id="apiKey" placeholder="Paste Free AI Studio API Key" />
+  <br>
+  <video id="preview" autoplay playsinline muted></video>
+  <canvas id="canvas" width="320" height="240" style="display:none;"></canvas>
+  <br>
+  <button id="startBtn" onclick="startCall()">Start Live Call</button>
+  <button id="stopBtn" class="stop" onclick="stopCall()" style="display:none;">End Call</button>
+  <div id="status">Idle — Enter API key and tap Start</div>
+
+  <script>
+    let ws = null;
+    let audioCtx = null;
+    let mediaStream = null;
+    let videoInterval = null;
+    let nextPlayTime = 0;
+
+    const statusEl = document.getElementById('status');
+    const previewEl = document.getElementById('preview');
+    const canvasEl = document.getElementById('canvas');
+    const ctx = canvasEl.getContext('2d');
+
+    async function startCall() {
+      const apiKey = document.getElementById('apiKey').value.trim();
+      if (!apiKey) return alert('Please paste your Google AI Studio API Key!');
+
+      statusEl.innerText = 'Requesting Mic & Camera...';
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: { sampleRate: 16000, channelCount: 1, echoCancellation: true, noiseSuppression: true },
+          video: { width: 320, height: 240, frameRate: 10 }
+        });
+        previewEl.srcObject = mediaStream;
+      } catch (err) {
+        return alert('Mic/Camera permission denied: ' + err.message);
+      }
+
+      // Connect to Gemini Live WebSocket
+      const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${apiKey}`;
+      ws = new WebSocket(url);
+
+      ws.onopen = () => {
+        statusEl.innerText = 'Connected! Sending setup...';
+        // 1. Send initial setup configuration once
+        ws.send(JSON.stringify({
+          setup: {
+            model: "models/gemini-3.8-live",
+            generationConfig: {
+              responseModalities: ["AUDIO"]
+            }
+          }
+        }));
+      };
+
+      ws.onmessage = async (event) => {
+        const rawText = event.data instanceof Blob ? await event.data.text() : event.data;
+        const data = JSON.parse(rawText);
+
+        // Start streaming mic & camera once setupComplete arrives
+        if (data.setupComplete) {
+          statusEl.innerText = 'Live! Speak or show your camera...';
+          document.getElementById('startBtn').style.display = 'none';
+          document.getElementById('stopBtn').style.display = 'inline-block';
+          startStreamingMicAndVideo();
+          return;
+        }
+
+        // Play incoming 24kHz PCM audio chunks from Gemini
+        const parts = data.serverContent?.modelTurn?.parts || [];
+        for (const part of parts) {
+          if (part.inlineData && part.inlineData.mimeType.startsWith('audio/pcm')) {
+            playPcmAudio(part.inlineData.data);
+          }
+        }
+      };
+
+      ws.onerror = (e) => { statusEl.innerText = 'WebSocket Error. Check console / API key.'; };
+      ws.onclose = () => { stopCall(); };
+    }
+
+    function startStreamingMicAndVideo() {
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+      const source = audioCtx.createMediaStreamSource(mediaStream);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+
+      // Stream 16kHz 16-bit PCM microphone audio continuously
+      processor.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const float32Data = e.inputBuffer.getChannelData(0);
+        const int16Data = new Int16Array(float32Data.length);
+        for (let i = 0; i < float32Data.length; i++) {
+          let s = Math.max(-1, Math.min(1, float32Data[i]));
+          int16Data[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+        const base64Audio = arrayBufferToBase64(int16Data.buffer);
+        ws.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{ mimeType: "audio/pcm;rate=16000", data: base64Audio }]
+          }
+        }));
+      };
+
+      // Stream 1 JPEG video frame per second (saves tokens while keeping live vision)
+      videoInterval = setInterval(() => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ctx.drawImage(previewEl, 0, 0, canvasEl.width, canvasEl.height);
+        const base64Jpeg = canvasEl.toDataURL('image/jpeg', 0.5).split(',')[1];
+        ws.send(JSON.stringify({
+          realtimeInput: {
+            mediaChunks: [{ mimeType: "image/jpeg", data: base64Jpeg }]
+          }
+        }));
+      }, 1000);
+    }
+
+    // Decode 24kHz Base64 PCM from Gemini and schedule seamless playback
+    function playPcmAudio(base64String) {
+      if (!audioCtx) return;
+      const binary = atob(base64String);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const int16 = new Int16Array(bytes.buffer);
+      const float32 = new Float32Array(int16.length);
+      for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768.0;
+
+      const buffer = audioCtx.createBuffer(1, float32.length, 24000);
+      buffer.getChannelData(0).set(float32);
+
+      const source = audioCtx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioCtx.destination);
+
+      const now = audioCtx.currentTime;
+      if (nextPlayTime < now) nextPlayTime = now;
+      source.start(nextPlayTime);
+      nextPlayTime += buffer.duration;
+    }
+
+    function arrayBufferToBase64(buffer) {
+      let binary = '';
+      const bytes = new Uint8Array(buffer);
+      for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+      return btoa(binary);
+    }
+
+    function stopCall() {
+      clearInterval(videoInterval);
+      if (ws) { ws.close(); ws = null; }
+      if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+      if (audioCtx) { audioCtx.close(); audioCtx = null; }
+      document.getElementById('startBtn').style.display = 'inline-block';
+      document.getElementById('stopBtn').style.display = 'none';
+      statusEl.innerText = 'Call ended.';
+    }
+  </script>
+</body>
+  </html>
+  
